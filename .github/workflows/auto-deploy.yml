@@ -1,0 +1,105 @@
+name: Auto deploy
+
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+on:
+  push:
+    branches:
+      #- develop
+      - feature/S05P21A507-83-auto-deploy
+    # Publish semver tags as releases.
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches:
+      #- develop
+      - feature/S05P21A507-83-auto-deploy
+
+env:
+  ROOT_DIR: ~/certblock
+
+jobs:
+  build-images:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      backend-image: ${{ steps.set-output.outputs.backendImage }}
+      nginx-image: ${{ steps.set-output.outputs.nginxImage }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set environment variables
+        run: |
+          echo "BACKEND_IMAGE=${{ secrets.REGISTRY }}/${{ secrets.REGISTRY_USERNAME }}/backend" >> $GITHUB_ENV
+          echo "NGINX_IMAGE=${{ secrets.REGISTRY }}/${{ secrets.REGISTRY_USERNAME }}/nginx" >> $GITHUB_ENV
+
+      - name: Set outputs for deploy
+        id: set-output
+        run: |
+          echo "::set-output name=backendImage::${{ env.BACKEND_IMAGE }}"
+          echo "::set-output name=nginxImage::${{ env.NGINX_IMAGE }}"
+
+      - name: Pull docker/dockerfile for docker buildkit
+        run: docker pull docker/dockerfile:1
+
+      - name: Build docker images
+        run: |
+          DOCKER_BUILDKIT=1 docker build -t ${{ env.BACKEND_IMAGE }}:latest --target prod ./backend
+          DOCKER_BUILDKIT=1 docker build -t ${{ env.NGINX_IMAGE }}:latest --target prod ./frontend
+
+  deploy:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: build-images
+    steps:
+      # Login against a Docker registry except on PR
+      # https://github.com/docker/login-action
+      - name: Log into registry ${{ secrets.REGISTRY }}
+        uses: docker/login-action@28218f9b04b4f3f62068d7b6ce6ca5b26e35336c
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Publish latest images
+        run: |
+          docker push ${{ needs.build-images.outputs.backend-image }}:latest
+          docker push ${{ needs.build-images.outputs.nginx-image }}:latest
+          #docker push ${{ env.NGINX_IMAGE }}:latest
+
+
+      # https://github.com/appleboy/scp-action
+      - name: Copy file via ssh
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "./docker-compose.yml, nginx"
+          target: ${{ env.ROOT_DIR }}
+
+      #  https://github.com/appleboy/ssh-action
+      - name: Execute remote ssh docker compose commands to run container
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ${{ env.ROOT_DIR }}
+            touch registry-password
+            echo ${{ secrets.REGISTRY_PASSWORD }} > registry-password
+            docker login ${{ secrets.REGISTRY }} -u ${{ secrets.REGISTRY_USERNAME }} --password-stdin < registry-password
+            rm registry-password
+            docker-compose pull
+            docker-compose up -d
+            docker system prune -f
+            docker logout ${{ secrets.REGISTRY }}
